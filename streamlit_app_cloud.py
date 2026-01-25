@@ -1,14 +1,23 @@
 """
-Professional Streamlit UI for Agentic Business Ops
-Modern, clean design with authentication and fast navigation
+Streamlit Cloud - Integrated Backend
+Runs backend logic directly (no separate API needed)
 """
 
 import streamlit as st
-import requests
-import json
+import sys
 import os
+import uuid
 from datetime import datetime
 from pathlib import Path
+
+# Add backend to path
+sys.path.insert(0, str(Path(__file__).parent / "backend"))
+sys.path.insert(0, str(Path(__file__).parent))
+
+# Set environment from secrets
+if hasattr(st, 'secrets'):
+    for key in st.secrets:
+        os.environ[key] = st.secrets[key]
 
 # Page config
 st.set_page_config(
@@ -18,8 +27,15 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-# API Base URL - use environment variable for production, fallback to localhost
-API_BASE = os.getenv("API_BASE_URL", "http://localhost:8000")
+# Import backend components
+BACKEND_AVAILABLE = False
+try:
+    from backend.agents.orchestrator.orchestrator import master_app
+    from backend.agents.onboarding.ingestion import process_document
+    from backend.data.db.storage import save_startup_profile
+    BACKEND_AVAILABLE = True
+except Exception as e:
+    pass
 
 # Professional CSS - Clean, light theme with excellent contrast
 st.markdown("""
@@ -526,20 +542,18 @@ def show_chat_page():
                 st.session_state.chat_history.append({"role": "user", "content": question})
                 st.session_state.questions_asked += 1
                 
-                with st.spinner("AI is analyzing..."):
-                    try:
-                        response = requests.post(
-                            f"{API_BASE}/api/question",
-                            json={"startup_id": st.session_state.startup_id, "question": question},
-                            timeout=120
-                        )
-                        if response.status_code == 200:
-                            answer = response.json()['answer']
+                if BACKEND_AVAILABLE:
+                    with st.spinner("AI is analyzing..."):
+                        try:
+                            result = master_app.invoke({"startup_id": st.session_state.startup_id, "user_question": question})
+                            answer = result.get('answer', 'Sorry, I could not process that.')
                             st.session_state.chat_history.append({"role": "assistant", "content": answer})
                             st.rerun()
-                    except:
-                        st.session_state.chat_history.append({"role": "assistant", "content": "Sorry, I encountered an error. Please try again."})
-                        st.rerun()
+                        except Exception as e:
+                            st.session_state.chat_history.append({"role": "assistant", "content": f"Error: {str(e)}"})
+                            st.rerun()
+                else:
+                    st.error("Backend not available")
         
         st.markdown('</div>', unsafe_allow_html=True)
     
@@ -552,23 +566,25 @@ def show_chat_page():
         
         if uploaded_file:
             if st.button("Process Document", use_container_width=True):
-                with st.spinner("Processing..."):
-                    try:
-                        files = {"file": (uploaded_file.name, uploaded_file, uploaded_file.type)}
-                        response = requests.post(f"{API_BASE}/api/upload", files=files, timeout=60)
-                        
-                        if response.status_code == 200:
-                            result = response.json()
-                            st.session_state.startup_id = result["startup_id"]
+                if BACKEND_AVAILABLE:
+                    with st.spinner("Processing..."):
+                        try:
+                            startup_id = str(uuid.uuid4())
+                            file_path = Path("backend/data/startups") / startup_id / uploaded_file.name
+                            file_path.parent.mkdir(parents=True, exist_ok=True)
+                            file_path.write_bytes(uploaded_file.read())
+                            
+                            context = process_document(startup_id, str(file_path))
+                            save_startup_profile(startup_id, context)
+                            
+                            st.session_state.startup_id = startup_id
                             st.session_state.documents_uploaded += 1
-                            st.markdown(f"""
-                            <div class="alert alert-success">
-                                <strong>Success!</strong><br>
-                                Document processed successfully
-                            </div>
-                            """, unsafe_allow_html=True)
-                    except Exception as e:
-                        st.error(f"Error: {str(e)}")
+                            st.success("✓ Document processed successfully!")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Error: {str(e)}")
+                else:
+                    st.error("Backend not available - AI features disabled")
         
         if st.session_state.startup_id:
             st.markdown(f"""
@@ -635,29 +651,18 @@ def show_plans_page():
         
         if st.button("Generate Plan", use_container_width=True):
             if st.session_state.startup_id and goal:
-                with st.spinner("Creating strategic plan..."):
-                    try:
-                        response = requests.post(
-                            f"{API_BASE}/api/plan",
-                            json={"startup_id": st.session_state.startup_id, "goal": goal, "time_horizon_days": time_horizon},
-                            timeout=180
-                        )
-                        if response.status_code == 200:
-                            plan = response.json()
+                if BACKEND_AVAILABLE:
+                    with st.spinner("Creating strategic plan..."):
+                        try:
+                            result = master_app.invoke({"startup_id": st.session_state.startup_id, "goal": goal, "time_horizon_days": time_horizon})
                             st.session_state.plans_generated += 1
                             
-                            st.markdown(f"""
-                            <div class="alert alert-success">
-                                <strong>Plan Created!</strong><br>
-                                {plan['title']}
-                            </div>
-                            """, unsafe_allow_html=True)
+                            st.success(f"✓ Plan created: {result.get('title', 'Action Plan')}")
                             
-                            # Add tasks to session state with proper priority distribution
-                            if plan.get('tasks'):
+                            # Add tasks with proper priority distribution
+                            if result.get('tasks'):
                                 st.session_state.current_tasks = []
-                                for idx, task in enumerate(plan['tasks']):
-                                    # Assign varied priorities
+                                for idx, task in enumerate(result['tasks']):
                                     if idx % 3 == 0:
                                         priority = 'high'
                                     elif idx % 3 == 1:
@@ -665,19 +670,19 @@ def show_plans_page():
                                     else:
                                         priority = 'low'
                                     
-                                    task_with_status = {
+                                    st.session_state.current_tasks.append({
                                         'id': f"task_{idx}",
                                         'title': task.get('title', 'Untitled Task'),
                                         'priority': priority,
                                         'start_date': task.get('start_date', 'TBD'),
                                         'end_date': task.get('end_date', 'TBD'),
                                         'completed': False
-                                    }
-                                    st.session_state.current_tasks.append(task_with_status)
-                                
+                                    })
                                 st.rerun()
-                    except Exception as e:
-                        st.error(f"Error: {str(e)}")
+                        except Exception as e:
+                            st.error(f"Error: {str(e)}")
+                else:
+                    st.error("Backend not available")
             else:
                 st.warning("Please upload a document first and enter a goal")
         
@@ -790,33 +795,32 @@ def show_analytics_page():
     st.markdown("<br>", unsafe_allow_html=True)
     
     # Business profile
-    if st.session_state.startup_id:
-        with st.spinner("Loading profile..."):
-            try:
-                response = requests.get(f"{API_BASE}/api/profile/{st.session_state.startup_id}", timeout=30)
-                if response.status_code == 200:
-                    profile = response.json()
-                    
-                    col1, col2 = st.columns(2)
-                    
-                    with col1:
-                        st.markdown('<div class="card">', unsafe_allow_html=True)
-                        st.markdown('<div class="card-header">Business Overview</div>', unsafe_allow_html=True)
-                        st.markdown(f"**Name:** {profile.get('business_name', 'N/A')}")
-                        st.markdown(f"**Type:** {profile.get('business_type', 'N/A')}")
-                        st.markdown(f"**Location:** {profile.get('location', 'N/A')}")
-                        st.markdown(f"**Stage:** {profile.get('stage', 'N/A')}")
-                        st.markdown('</div>', unsafe_allow_html=True)
-                    
-                    with col2:
-                        st.markdown('<div class="card">', unsafe_allow_html=True)
-                        st.markdown('<div class="card-header">Key Metrics</div>', unsafe_allow_html=True)
-                        st.markdown(f"**Goals:** {len(profile.get('goals', []))}")
-                        st.markdown(f"**Constraints:** {len(profile.get('key_constraints', []))}")
-                        st.markdown(f"**Competitors:** {len(profile.get('competitors', []))}")
-                        st.markdown('</div>', unsafe_allow_html=True)
-            except:
-                pass
+    if st.session_state.startup_id and BACKEND_AVAILABLE:
+        try:
+            from backend.data.db.storage import get_startup_profile
+            profile = get_startup_profile(st.session_state.startup_id)
+            
+            if profile:
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    st.markdown('<div class="card">', unsafe_allow_html=True)
+                    st.markdown('<div class="card-header">Business Overview</div>', unsafe_allow_html=True)
+                    st.markdown(f"**Name:** {profile.get('business_name', 'N/A')}")
+                    st.markdown(f"**Type:** {profile.get('business_type', 'N/A')}")
+                    st.markdown(f"**Location:** {profile.get('location', 'N/A')}")
+                    st.markdown(f"**Stage:** {profile.get('stage', 'N/A')}")
+                    st.markdown('</div>', unsafe_allow_html=True)
+                
+                with col2:
+                    st.markdown('<div class="card">', unsafe_allow_html=True)
+                    st.markdown('<div class="card-header">Key Metrics</div>', unsafe_allow_html=True)
+                    st.markdown(f"**Goals:** {len(profile.get('goals', []))}")
+                    st.markdown(f"**Constraints:** {len(profile.get('key_constraints', []))}")
+                    st.markdown(f"**Competitors:** {len(profile.get('competitors', []))}")
+                    st.markdown('</div>', unsafe_allow_html=True)
+        except:
+            pass
 
 # Main app logic
 if not st.session_state.authenticated:
